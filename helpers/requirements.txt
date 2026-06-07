@@ -1,0 +1,3 @@
+#pip3 install -r requirements.txt
+ccxt>=4.4
+blynklib>=0.2.6
