@@ -6,9 +6,9 @@ Each configured coin runs as its own async task with its own live ticker stream,
 
 > ⚠️⚠️⚠️ **This bot can place real orders with real money.**⚠️⚠️⚠️ 
 - ⚠️ It is a personal project, provided as-is with no warranty. 
-- ⚠️ This is not any sort of financial advice.  Do your due diligence!
+- ⚠️ This is not any form or sort of financial advice.  
 - ⚠️ Trade at your own risk and test thoroughly in paper mode first.
-- ⚠️ Any config included is just a example config.  Change the values as you see fit to the coin.
+- ⚠️ Any config included is just an example config.  Change the values as you see fit to the coin.
 - ⚠️ My experiences and settings are not advice.
 - ⚠️ Make sure to read [Caveats](#caveats) below.
 
@@ -154,12 +154,12 @@ BLYNK_TOKEN=your_blynk_token
 ---
 
 ## Usage Tips 
-- Every coin is different - **do you due diligence always for each coin BEFORE going live**
-- Before making changes to your config, backup your settings for coins perfomance comparison.
-- Use your exchanges plot tool and make your grid with your drop percent you are testing.  Look and see if you will be hitting the slumps and rallies with the spacing/rounds.  See example calc & image below. 
+- Every coin is different - **always do your due diligence for each coin BEFORE going live**
+- Before making changes to your config, back up your settings for coin performance comparison.
+- Use your exchange's plot tool and make your grid with your drop percent you are testing.  Look and see if you will be hitting the slumps and rallies with the spacing/rounds.  See example calc & image below. 
 
 
-My method?, I find the spacing with this rough formula, making small changes & then testing.
+My method? I find the spacing with this rough formula, making small changes & then testing.
 
 
 1. (high_price - low_price) / max_grid_levels) = dollars_per_grid.
@@ -173,7 +173,7 @@ To check your values:
 
 So if you look at this graph you can see it is hitting the highs and lows with a 3% spacing or about $2.  You want to look at the time scale for how long the high/low cycle is that you are trying to capture.  Your working dollars are going to be divided equally between the grids so ideally, you want it to buy as much as it can and then sell.
 
-If you are working with $600, your grids will be $60 for 10 grids.  Not a ton of profit per buy if it sells at profit but its something at least!
+If you are working with $600, your grids will be $60 for 10 grids.  Not a ton of profit per buy if it sells at profit but it's something at least!
 
 You need to fall just as much as you need it to rise for the bot to work.  So don't get too discouraged when you are showing negative pnl per coin often.  
 
@@ -182,44 +182,44 @@ You need to fall just as much as you need it to rise for the bot to work.  So do
 
 
 Trade offs
-- High % drop, less buys
+- High % drop, fewer buys
 - Low % drop, exhausts your grids and you bottom out (running out of grids but price is still falling)
 - if the price just keeps dropping & doesn't recover, you are left holding the bag...
-- If the price keeps rising, no buys execute or it sells at your set take profit and you miss out on a larger profits.
+- If the price keeps rising, no buys execute or it sells at your set take profit and you miss out on larger profits.
 - Trailing is also risky.
 
 
 
 Running out of grids is worse than not buying much imo.  Running out will screw it all up.  Trailing helps this. You want it to keep buying as the price drops so it drives down the average buy price & that is what the program is deriving the sell price with.
 
-Lets use a example of a bad setup that I had.  Lets say you have $1000 and you want a good amount to sell each time so you put your grid spacing big with less of them.
+Let's use an example of a bad setup that I had.  Let's say you have $1000 and you want a good amount to sell each time so you put your grid spacing big with less of them.
 
-BTC price ($72k) is falling & you hace 4 grids.  
+BTC price ($72k) is falling & you have 4 grids.  
 - it buys at 70k, 68k, 66k & finally at 64k.
 - You are done buying, no grids left.
 
 BTC price falls to $55k
 - This is bad (obviously for a couple reasons lol)
-- Your avg. entry is 67k after all the buys.  Thats a ways from the current price @55k.
+- Your avg. entry is 67k after all the buys.  That's a ways from the current price @55k.
 - Plus if your take profit is 3%, you have even further till it reaches 69.1k and the sell executes.
 
 Same spacing but more grids:
 - buys at 70k, 68k, 66k, 64k, 62k, 60k, 58k, & finally 56k
-(70+68+66+64+62+60+58+56) / 8 grids = 63k average buy price.  Much closer to you take profit @ 64.89k.  Still far but more likely to sell.
+(70+68+66+64+62+60+58+56) / 8 grids = 63k average buy price.  Much closer to your take profit @ 64.89k.  Still far but more likely to sell.
 
 
 
 Trailing Settings
 
-To solve the problem of running out of grids & buying/selling at the lowest/highest you can rather than at the exact grid level, trailing is used.  Same example above.  Let say the price falls past the grid level & a buy is triggered.  If it keeps falling, it will "trail" the price down until it bounces up to your trailing %.
+To solve the problem of running out of grids & buying/selling at the lowest/highest you can rather than at the exact grid level, trailing is used.  Same example above.  Let's say the price falls past the grid level & a buy is triggered.  If it keeps falling, it will "trail" the price down until it bounces up to your trailing %.
 
-Both good and bad.  Good if it is set right & saves some grids by not buying till its done falling or rising to lower your entry price. Your average entry is driven down and grids to spare. Bad if the price is falling and not increasing to your bounce back as it falls. Then you could for example end up with buys at 70k, 67k, 63k, 57k, etc...  or in the case of rapid falls, 70k, 55k and thats it.  So now it goes up but you only have two grids so not much profit... assuming it hits your sell %.
+Both good and bad.  Good if it is set right & saves some grids by not buying till it's done falling or rising to lower your entry price. Your average entry is driven down and grids to spare. Bad if the price is falling and not increasing to your bounce back as it falls. Then you could for example end up with buys at 70k, 67k, 63k, 57k, etc...  or in the case of rapid falls, 70k, 55k and that's it.  So now it goes up but you only have two grids so not much profit... assuming it hits your sell %.
 
 
 Lots to think about...
 
 
-Here is a example log entry for a buy:
+Here is an example log entry for a buy:
 ![hype_grid_setup](trailingBuy.png)
 
 Stat Screen for a coin:
