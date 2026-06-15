@@ -80,7 +80,9 @@ When run in a terminal, the bot has a live keypress menu:
   | 7 | **force BUY now** (market) |
   | 8 | **sell ALL now** (market) |
   | 9 | clear stats (full reset) |
+  | t | clear targets (reset first-buy to −`drop_pct` from now) |
 
+- **Clear targets** re-baselines the initial-entry reference to the *current* price. Use it when a coin sold near a top and the first-buy target has drifted far below `drop_pct` (e.g. live stats shows "−10.4% from now") because the observed high went stale while the coin was paused or a limit buy was resting. After clearing, the first buy arms at `current_price × (1 − drop_pct)`. It only affects a fresh cycle (no open position) and never cancels resting orders or touches the grid.
 - Press **`a`** for an all-coin summary, **`?`** for help, **Ctrl-C** to quit.
 - Every action asks for a **`Y`** confirmation except live stats.
 

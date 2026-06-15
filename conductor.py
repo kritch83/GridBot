@@ -601,6 +601,7 @@ async def run(simulate_file: Optional[str], dry_run: bool) -> None:
         "buy":                  "manual force-buy",
         "sell_all":             "manual force-sell-all",
         "clear_stats":          "manual clear-stats",
+        "clear_targets":        "manual clear-targets",
     }
 
     HELP_TEXT = (
@@ -611,7 +612,7 @@ async def run(simulate_file: Optional[str], dry_run: bool) -> None:
         "Action menu (after selecting a coin), type the number:\n"
         "  1 stats      2 config             3 arm sell-trail    4 pause\n"
         "  5 breakeven  6 pause-after-sell   7 BUY now           8 sell ALL now\n"
-        "  9 clear stats (full reset)\n"
+        "  9 clear stats (full reset)        t clear targets (reset first-buy)\n"
         "  Every action asks 'Y' to confirm except 1 (stats).  0/ENTER cancels.\n"
         "Ctrl-C to quit."
     ).format(n=len(enabled))
@@ -621,6 +622,7 @@ async def run(simulate_file: Optional[str], dry_run: bool) -> None:
         lines = [menu_banner(sym), "  choose an action (type number; 0/ENTER cancels):"]
         for i, (label, _k, _needs) in enumerate(ACTIONS, start=1):
             lines.append(f"   {i}) {label}")
+        lines.append("   t) clear targets (reset first-buy to -drop_pct from now)")
         lines.append("  all actions ask 'Y' to confirm except 1) live stats")
         return "\n".join(lines)
 
@@ -661,8 +663,17 @@ async def run(simulate_file: Optional[str], dry_run: bool) -> None:
                 selected_idx[0] = None
                 print("  (menu cancelled)")
                 return
+            if ch in ("t", "T"):   # lettered action -- numbered menu is full (1-9)
+                selected_idx[0] = None
+                dp = enabled[idx].get("drop_pct", 0.0)
+                print(
+                    f"  {sym}: clear targets -- re-baseline first-buy to "
+                    f"-{dp:.1%} from current price.  Type Y to confirm, any other key cancels"
+                )
+                confirm_cmd[0] = (idx, "clear_targets", "clear targets")
+                return
             if not ch.isdigit():
-                print("  type a menu number, or 0/ENTER to cancel")
+                print("  type a menu number (or 't'), or 0/ENTER to cancel")
                 return
             n = int(ch)
             if not (1 <= n <= len(ACTIONS)):

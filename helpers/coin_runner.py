@@ -973,6 +973,32 @@ def apply_manual(cmd: PendingAction, state: State, cfg: dict, current_price: flo
             log.info("MANUAL: pause-after-sell DISARMED")
         return None
 
+    if cmd.kind == "clear_targets":
+        # Re-baseline the initial-entry reference to the current price so the
+        # first buy of a fresh cycle arms at current * (1 - drop_pct) again,
+        # instead of trailing a stale "observed high" that drifted while the
+        # coin was paused / a limit buy was resting. Only meaningful pre-entry;
+        # with a position open there is no "first low" to reset, so we just
+        # disarm any half-formed buy trail and leave the grid alone.
+        if state.positions:
+            state.trailing_buy = TrailState()
+            log.info(
+                f"MANUAL: clear-targets -- position open; disarmed pending buy-trail. "
+                f"Grid buys still measured from last buy ${state.last_buy_price or 0.0:.{pp}f}."
+            )
+            return None
+        old = state.initial_entry_high
+        state.initial_entry_high = current_price
+        state.trailing_buy = TrailState()
+        arm = current_price * (1 - cfg["drop_pct"])
+        was = f" (was ${old:.{pp}f})" if old is not None else ""
+        log.info(
+            f"MANUAL: clear-targets -- first-buy reference reset to "
+            f"${current_price:.{pp}f}{was}; will arm at ${arm:.{pp}f} "
+            f"(-{cfg['drop_pct']:.1%} from now)"
+        )
+        return None
+
     if cmd.kind == "clear_stats":
         # Needs exchange access (to cancel resting orders), so it's executed in
         # the run_coin dispatch loop -- just pass it through here.
