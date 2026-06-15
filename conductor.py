@@ -578,20 +578,23 @@ async def run(simulate_file: Optional[str], dry_run: bool) -> None:
     confirm_cmd:  list = [None]    # (idx, kind, label) awaiting Y/N confirmation
     balance_holder: dict = {"usd": None, "ts": 0.0}
 
-    # Action menu: (label, kind, needs_confirm). 'stats'/'config' are handled
-    # locally (printed); the rest are enqueued as PendingActions for the coin task.
-    # (label, kind, needs_confirm). Everything asks Y to confirm except live stats.
+    # Action menu: (key, label, kind, needs_confirm). 'stats'/'config' are
+    # handled locally (printed); the rest are enqueued as PendingActions for the
+    # coin task. Selection is by the single-char key (digits 1-9 are full, so
+    # extra actions use a letter). Everything asks Y to confirm except live stats.
     ACTIONS = [
-        ("live stats",                 "stats",                False),
-        ("config",                     "config",               True),
-        ("arm sell-trail",             "arm_sell_trail",       True),
-        ("toggle pause",               "pause_toggle",         True),
-        ("toggle breakeven-exit",      "arm_breakeven_exit",   True),
-        ("toggle pause-after-sell",    "arm_pause_after_sell", True),
-        ("force BUY now (market)",     "buy",                  True),
-        ("sell ALL now (market)",      "sell_all",             True),
-        ("clear stats (FULL reset)",   "clear_stats",          True),
+        ("1", "live stats",                 "stats",                False),
+        ("2", "config",                     "config",               True),
+        ("3", "arm sell-trail",             "arm_sell_trail",       True),
+        ("4", "toggle pause",               "pause_toggle",         True),
+        ("5", "toggle breakeven-exit",      "arm_breakeven_exit",   True),
+        ("6", "toggle pause-after-sell",    "arm_pause_after_sell", True),
+        ("7", "force BUY now (market)",     "buy",                  True),
+        ("8", "sell ALL now (market)",      "sell_all",             True),
+        ("9", "clear stats (FULL reset)",   "clear_stats",          True),
+        ("t", "clear targets (reset first-buy to -drop_pct)", "clear_targets", True),
     ]
+    ACTION_BY_KEY = {a[0]: a for a in ACTIONS}
 
     REASONS = {
         "pause_toggle":         "manual pause toggle",
@@ -609,7 +612,7 @@ async def run(simulate_file: Optional[str], dry_run: bool) -> None:
         "  <digit>   select a coin (1-{n}) -> opens its action menu\n"
         "  a         all-coin summary\n"
         "  ?         this help\n"
-        "Action menu (after selecting a coin), type the number:\n"
+        "Action menu (after selecting a coin), type the key:\n"
         "  1 stats      2 config             3 arm sell-trail    4 pause\n"
         "  5 breakeven  6 pause-after-sell   7 BUY now           8 sell ALL now\n"
         "  9 clear stats (full reset)        t clear targets (reset first-buy)\n"
@@ -619,10 +622,9 @@ async def run(simulate_file: Optional[str], dry_run: bool) -> None:
 
     def _action_menu(idx: int) -> str:
         sym = enabled[idx]["symbol"]
-        lines = [menu_banner(sym), "  choose an action (type number; 0/ENTER cancels):"]
-        for i, (label, _k, _needs) in enumerate(ACTIONS, start=1):
-            lines.append(f"   {i}) {label}")
-        lines.append("   t) clear targets (reset first-buy to -drop_pct from now)")
+        lines = [menu_banner(sym), "  choose an action (type the key; 0/ENTER cancels):"]
+        for key, label, _k, _needs in ACTIONS:
+            lines.append(f"   {key}) {label}")
         lines.append("  all actions ask 'Y' to confirm except 1) live stats")
         return "\n".join(lines)
 
@@ -655,7 +657,7 @@ async def run(simulate_file: Optional[str], dry_run: bool) -> None:
                 print(f"  cancelled: {label}")
             return
 
-        # 2) A coin is selected -> its action menu is open; expect a number
+        # 2) A coin is selected -> its action menu is open; expect an action key
         if selected_idx[0] is not None:
             idx = selected_idx[0]
             sym = enabled[idx]["symbol"]
@@ -663,23 +665,13 @@ async def run(simulate_file: Optional[str], dry_run: bool) -> None:
                 selected_idx[0] = None
                 print("  (menu cancelled)")
                 return
-            if ch in ("t", "T"):   # lettered action -- numbered menu is full (1-9)
-                selected_idx[0] = None
-                dp = enabled[idx].get("drop_pct", 0.0)
-                print(
-                    f"  {sym}: clear targets -- re-baseline first-buy to "
-                    f"-{dp:.1%} from current price.  Type Y to confirm, any other key cancels"
-                )
-                confirm_cmd[0] = (idx, "clear_targets", "clear targets")
+            key = ch.lower() if ch.isalpha() else ch
+            action = ACTION_BY_KEY.get(key)
+            if action is None:
+                valid = "/".join(a[0] for a in ACTIONS)
+                print(f"  no action '{ch}' (valid: {valid}); 0/ENTER cancels")
                 return
-            if not ch.isdigit():
-                print("  type a menu number (or 't'), or 0/ENTER to cancel")
-                return
-            n = int(ch)
-            if not (1 <= n <= len(ACTIONS)):
-                print(f"  no action {n} (valid 1-{len(ACTIONS)})")
-                return
-            label, kind, needs_confirm = ACTIONS[n - 1]
+            _key, label, kind, needs_confirm = action
             selected_idx[0] = None
             if not needs_confirm:   # only 'live stats' -- show immediately
                 print(format_stats(states[sym], enabled[idx], last_price[sym], wallet, balance_holder))
@@ -695,6 +687,12 @@ async def run(simulate_file: Optional[str], dry_run: bool) -> None:
                             f"(they stay on Kraken!)")
                 msg += ".  Coin will be PAUSED after.  Type Y to confirm:"
                 print(msg)
+            elif kind == "clear_targets":
+                dp = enabled[idx].get("drop_pct", 0.0)
+                print(
+                    f"  {sym}: clear targets -- re-baseline first-buy to "
+                    f"-{dp:.1%} from current price.  Type Y to confirm, any other key cancels"
+                )
             else:
                 print(f"  {sym}: {label} -- type Y to confirm, any other key cancels")
             confirm_cmd[0] = (idx, kind, label)
