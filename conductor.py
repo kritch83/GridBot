@@ -87,12 +87,16 @@ async def push_notify(message: str) -> None:
 KRAKEN_BALANCE_REFRESH_SEC = 30.0
 
 
-async def kraken_balance_refresher(exchange, holder: dict) -> None:
-    """Periodically poll exchange.fetch_balance() and store free USD into holder.
+async def kraken_balance_refresher(exchange, holder: dict, bases: tuple = ()) -> None:
+    """Periodically poll exchange.fetch_balance() and store balances into holder.
 
-    holder is a shared dict {"usd": Optional[float], "ts": float} read by the
-    keypress-driven status screens. The loop never raises -- errors are logged
-    and the holder is left at its last-good value (or None if never fetched).
+    holder is a shared dict {"usd": Optional[float], "coins": dict, "ts": float}
+    read by the keypress-driven status screens. "coins" maps each base asset
+    (e.g. "TAO") to its TOTAL balance on the exchange -- the *true* wallet
+    holding (free + tied up in open orders), as opposed to state.total_qty_coin
+    which is only the bot's current open grid position. The loop never raises --
+    errors are logged and the holder is left at its last-good value (or
+    None/empty if never fetched).
     """
     while True:
         try:
@@ -104,7 +108,18 @@ async def kraken_balance_refresher(exchange, holder: dict) -> None:
                 free = (bal.get("free") or {}).get("USD")
             if free is not None:
                 holder["usd"] = float(free)
-                holder["ts"] = time.time()
+            # Per-coin TOTAL balances -- the real wallet holding for each base.
+            coins: dict = {}
+            total_map = bal.get("total") or {}
+            for base in bases:
+                blk = bal.get(base) or {}
+                tot = blk.get("total")
+                if tot is None:
+                    tot = total_map.get(base)
+                if tot is not None:
+                    coins[base] = float(tot)
+            holder["coins"] = coins
+            holder["ts"] = time.time()
         except ccxt.NetworkError as e:
             logging.warning("Kraken balance fetch network error: %s", e)
         except Exception as e:
@@ -119,6 +134,29 @@ def _kraken_usd_line(balance_holder: Optional[dict], label_width: int) -> Option
     usd = balance_holder["usd"]
     age = max(0, int(time.time() - balance_holder.get("ts", 0.0)))
     return f"{'Kraken USD:':<{label_width}}${usd:,.2f}  ({age}s ago)"
+
+
+def _kraken_coin_line(balance_holder: Optional[dict], base: str, tracked_qty: float,
+                      label_width: int) -> Optional[str]:
+    """Render the real Kraken wallet balance for `base` next to the bot-tracked
+    grid qty and the untracked remainder. None if no balance has been fetched.
+
+    `tracked_qty` is state.total_qty_coin -- only the bot's open grid position.
+    The wallet total can be larger (coins held outside the current grid: prior
+    holdings, manual buys, leftovers from 'clear stats') -- that gap is what
+    shows up as 'untracked'.
+    """
+    if not balance_holder:
+        return None
+    total = (balance_holder.get("coins") or {}).get(base)
+    if total is None:
+        return None
+    age = max(0, int(time.time() - balance_holder.get("ts", 0.0)))
+    untracked = total - tracked_qty
+    return (
+        f"{('Kraken ' + base + ':'):<{label_width}}{total:.8f}  "
+        f"(grid {tracked_qty:.8f}, {untracked:+.8f} untracked, {age}s ago)"
+    )
 
 
 # --- Big ASCII banner (for the action-menu coin name) -----------------------
@@ -248,6 +286,9 @@ def format_stats(state: State, cfg: dict, last_price: Optional[float], wallet: P
     kraken_line = _kraken_usd_line(balance_holder, L)
     if kraken_line:
         out.append(kraken_line)
+    coin_line = _kraken_coin_line(balance_holder, base, state.total_qty_coin, L)
+    if coin_line:
+        out.append(coin_line)
     out.append("")
 
     if state.positions:
@@ -313,8 +354,13 @@ def format_stats(state: State, cfg: dict, last_price: Optional[float], wallet: P
         out.append(f"{'  Cancels when:':<{L}}price < ${cancel:,.{pp}f}{delta_str(cancel)}")
     elif state.trailing_sell.armed and state.trailing_sell.extreme is not None:
         fire = state.trailing_sell.extreme * (1 - trail_sell_pct)
-        out.append(f"{'  Trail:':<{L}}ARMED  (high so far ${state.trailing_sell.extreme:,.{pp}f})")
-        out.append(f"{'  Fires at:':<{L}}${fire:,.{pp}f}{delta_str(fire)}")
+        if state.trailing_sell.manual and state.avg_entry_price is not None:
+            avg = state.avg_entry_price
+            out.append(f"{'  Trail:':<{L}}ARMED (manual stop -- floor avg ${avg:,.{pp}f}, no loss)  (high so far ${state.trailing_sell.extreme:,.{pp}f})")
+            out.append(f"{'  Fires at:':<{L}}${fire:,.{pp}f}{delta_str(fire)}  (clamped: only sells >= ${avg:,.{pp}f})")
+        else:
+            out.append(f"{'  Trail:':<{L}}ARMED  (high so far ${state.trailing_sell.extreme:,.{pp}f})")
+            out.append(f"{'  Fires at:':<{L}}${fire:,.{pp}f}{delta_str(fire)}")
     elif state.positions and state.avg_entry_price is not None:
         from helpers.coin_runner import sell_threshold
         arm, source_label, _ = sell_threshold(state, cfg)
@@ -408,6 +454,7 @@ def format_all_stats(states: dict, cfgs: list, last_price: dict, wallet: PaperWa
             status_tags.append("[BE-EXIT]")
         if st.pause_after_sell:
             status_tags.append("[PAUSE-AFTER-SELL]")
+        wal = (balance_holder.get("coins") or {}).get(base) if balance_holder else None
         rows.append({
             "n":       f"{i})",
             "sym":     sym,
@@ -415,7 +462,8 @@ def format_all_stats(states: dict, cfgs: list, last_price: dict, wallet: PaperWa
             "real":    f"${st.realized_pnl_usd:+,.{pp}f}",
             "cycle":   str(st.cycle_count),
             "avg":     f"${st.avg_entry_price:,.{pp}f}" if st.avg_entry_price else "-",
-            "qty":     f"{st.total_qty_coin:.8f} {base}" if st.positions else "-",
+            "qty":     f"{st.total_qty_coin:.8f}" if st.positions else "-",
+            "wallet":  f"{wal:.8f}" if wal is not None else "-",
             "price":   f"${lp:,.{pp}f}" if lp else "?",
             "unreal":  unreal,
             "status":  " ".join(status_tags),
@@ -428,14 +476,15 @@ def format_all_stats(states: dict, cfgs: list, last_price: dict, wallet: PaperWa
         w_real   = max(len("Realized"),   *(len(r["real"])   for r in rows))
         w_cycle  = max(len("Cycle"),      *(len(r["cycle"])  for r in rows))
         w_avg    = max(len("Avg entry"),  *(len(r["avg"])    for r in rows))
-        w_qty    = max(len("Holdings"),   *(len(r["qty"])    for r in rows))
+        w_qty    = max(len("Grid"),       *(len(r["qty"])    for r in rows))
+        w_wallet = max(len("Wallet"),     *(len(r["wallet"]) for r in rows))
         w_price  = max(len("Price"),      *(len(r["price"])  for r in rows))
         w_unreal = max(len("Unrealized"), *(len(r["unreal"]) for r in rows))
 
         out.append(
             f"  {'':<{w_n}} {'Symbol':<{w_sym}}  "
             f"{'Cycle':>{w_cycle}}  {'Pos':>{w_pos}}  "
-            f"{'Holdings':<{w_qty}}  {'Price':>{w_price}}  "
+            f"{'Grid':<{w_qty}}  {'Wallet':<{w_wallet}}  {'Price':>{w_price}}  "
             f"{'Avg entry':>{w_avg}}  {'Unrealized':>{w_unreal}}  "
             f"{'Realized':>{w_real}}  Status"
         )
@@ -443,7 +492,7 @@ def format_all_stats(states: dict, cfgs: list, last_price: dict, wallet: PaperWa
             out.append(
                 f"  {r['n']:<{w_n}} {r['sym']:<{w_sym}}  "
                 f"{r['cycle']:>{w_cycle}}  {r['pos']:>{w_pos}}  "
-                f"{r['qty']:<{w_qty}}  {r['price']:>{w_price}}  "
+                f"{r['qty']:<{w_qty}}  {r['wallet']:<{w_wallet}}  {r['price']:>{w_price}}  "
                 f"{r['avg']:>{w_avg}}  {r['unreal']:>{w_unreal}}  "
                 f"{r['real']:>{w_real}}  {r['status']}"
             )
@@ -576,7 +625,7 @@ async def run(simulate_file: Optional[str], dry_run: bool) -> None:
     # Keypress listener state
     selected_idx: list = [None]    # coin index whose action menu is open (None = idle)
     confirm_cmd:  list = [None]    # (idx, kind, label) awaiting Y/N confirmation
-    balance_holder: dict = {"usd": None, "ts": 0.0}
+    balance_holder: dict = {"usd": None, "coins": {}, "ts": 0.0}
 
     # Action menu: (key, label, kind, needs_confirm). 'stats'/'config' are
     # handled locally (printed); the rest are enqueued as PendingActions for the
@@ -730,7 +779,8 @@ async def run(simulate_file: Optional[str], dry_run: bool) -> None:
     heartbeat_task = asyncio.create_task(blynk_heartbeat(blynk, states, enabled))
     balance_task = None
     if MODE == "live" and not simulate_file:
-        balance_task = asyncio.create_task(kraken_balance_refresher(exchange, balance_holder))
+        bases = tuple(c["symbol"].split("/")[0] for c in enabled)
+        balance_task = asyncio.create_task(kraken_balance_refresher(exchange, balance_holder, bases))
     coin_tasks = [
         asyncio.create_task(
             run_coin(

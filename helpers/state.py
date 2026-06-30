@@ -24,6 +24,9 @@ class TrailState:
     armed: bool = False
     extreme: Optional[float] = None
     armed_at_price: Optional[float] = None
+    # Manually-armed sell-trail (option #3). Trails as a pure trailing stop:
+    # the take-profit floor is bypassed so it can arm/fire below avg*(1+tp_pct).
+    manual: bool = False
 
 
 @dataclass

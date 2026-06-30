@@ -192,23 +192,39 @@ def handle_sell_trail(state: State, price: float, cfg: dict, log: logging.Logger
         log.info(f"[{state.mode.upper()}] {tag} high=${price:.{pp}f}")
         return None
 
+    # A manually-armed trail (option #3) is a trailing stop clamped to avg entry:
+    # it bypasses the take-profit floor (so it can arm/trail below avg*(1+tp_pct)),
+    # but it never sells below avg entry -- a pull-back that would realize a loss
+    # is held (keep trailing for a profitable exit) instead of firing or disarming.
+    # An auto trail uses the take-profit threshold as its floor and disarms (to
+    # re-arm cleanly later) whenever price slips back below it.
+    manual = state.trailing_sell.manual
+    floor = state.avg_entry_price if manual else tp_threshold
+
     fire_threshold = state.trailing_sell.extreme * (1 - trail_sell_pct)
     if price <= fire_threshold:
-        if price >= tp_threshold:
+        if price >= floor:
             action = PendingAction(
                 "sell_all",
-                reason=f"trail-back -{trail_sell_pct:.1%} off high ${state.trailing_sell.extreme:.{pp}f}",
+                reason=(
+                    f"trail-back -{trail_sell_pct:.1%} off high "
+                    f"${state.trailing_sell.extreme:.{pp}f}" + (" (manual stop)" if manual else "")
+                ),
             )
             state.trailing_sell = TrailState()
             return action
+        if manual:
+            # Pull-back would lock in a loss -- stay armed and keep trailing for a
+            # profitable exit rather than selling below avg entry.
+            return None
         log.info(
             f"[{state.mode.upper()}] {tag} DISARMED at ${price:.{pp}f} "
-            f"(below ${tp_threshold:.{pp}f} -- {source_label})"
+            f"(below ${floor:.{pp}f} -- {source_label})"
         )
         state.trailing_sell = TrailState()
         return None
 
-    if price < tp_threshold:
+    if not manual and price < tp_threshold:
         log.info(
             f"[{state.mode.upper()}] {tag} DISARMED price=${price:.{pp}f} "
             f"below ${tp_threshold:.{pp}f} ({source_label})"
@@ -615,13 +631,33 @@ async def check_pending_buy(exchange, state: State, wallet: PaperWallet, cfg: di
     return False
 
 
+# A live sell is clamped to the exchange free balance (see live_sellable_qty),
+# so the qty actually sold can be below the tracked position. Selling at least
+# this fraction of the tracked qty is a normal full close -- the tiny remainder
+# is just fee dust Kraken shaved off the base coin. Below it, the fill is a
+# *partial* close: the tracked position has desynced from the real balance, so
+# we book PnL on the sold portion only, keep the rest on the books, and pause
+# the coin. Charging the whole stack's cost against a half-size fill is what
+# fabricated the ~$175 phantom "loss" on SYN cycle 6.
+FULL_CLOSE_MIN_FILL_FRAC = 0.98
+
+
 async def _finalize_sell(state: State, fill: dict, cfg: dict, reason: str, tag: str,
-                          log: logging.LoggerAdapter, push_notify) -> float:
+                          log: logging.LoggerAdapter, push_notify,
+                          pause_on_partial: bool = True) -> float:
     """Post-fill state cleanup shared by market sells and limit-sell fills.
 
     `fill` must carry: qty, price, fee_usd, proceeds_net (or we compute it).
     `tag` is a short log label ("SELL-ALL" for market, "LIMIT-SELL FILL" for limit).
     Returns realized PnL.
+
+    Realized PnL is always booked against the cost basis of the coins *actually*
+    sold. On a full close that is the whole position; on a partial fill it is the
+    proportional (average-cost) share and the unsold remainder is kept on the
+    books. `pause_on_partial` (default True) pauses the coin on a partial -- the
+    caller sets it False when the remainder is known-good (e.g. the unfilled part
+    of a cancelled order, which is genuinely back in free balance) rather than a
+    balance/tracking desync that needs manual reconciliation.
     """
     pp     = cfg["price_prec"]
     symbol = cfg["symbol"]
@@ -629,32 +665,89 @@ async def _finalize_sell(state: State, fill: dict, cfg: dict, reason: str, tag: 
 
     qty          = fill["qty"]
     proceeds_net = fill.get("proceeds_net", qty * fill["price"] - fill["fee_usd"])
-    realized     = proceeds_net - state.total_cost_usd
+    tracked      = state.total_qty_coin
     n_levels     = len(state.positions)
     avg_entry    = state.avg_entry_price or 0.0
-    pct          = (realized / state.total_cost_usd * 100) if state.total_cost_usd > 0 else 0.0
 
+    partial = tracked > 0 and (qty / tracked) < FULL_CLOSE_MIN_FILL_FRAC
+
+    if partial:
+        # Cost basis of only the coins that sold (average-cost allocation).
+        frac_sold     = qty / tracked
+        cost_basis    = state.total_cost_usd * frac_sold
+        remaining_qty = tracked - qty
+    else:
+        cost_basis = state.total_cost_usd
+
+    realized = proceeds_net - cost_basis
+    pct      = (realized / cost_basis * 100) if cost_basis > 0 else 0.0
     state.realized_pnl_usd += realized
-    state.positions = []
-    state.total_qty_coin = 0.0
-    state.total_cost_usd = 0.0
-    state.avg_entry_price = None
-    state.last_buy_price = None
-    state.cycle_count += 1
-    state.last_action_ts = time.time()
-    state.initial_entry_high = None
-    state.breakeven_exit_armed = False
-    state.trailing_buy = TrailState()
-    state.trailing_sell = TrailState()
-    state.pending_sell_order = None
+
+    if partial:
+        # Scale every level down proportionally so per-level data stays
+        # consistent with the new totals and avg_entry is preserved.
+        keep = 1.0 - frac_sold
+        for p in state.positions:
+            p.qty_coin *= keep
+            p.fee_usd  *= keep
+        state.total_qty_coin  = remaining_qty
+        state.total_cost_usd -= cost_basis
+        state.avg_entry_price = (
+            state.total_cost_usd / remaining_qty if remaining_qty > 0 else None
+        )
+        state.last_action_ts  = time.time()
+        state.trailing_sell   = TrailState()
+        state.pending_sell_order = None
+        if pause_on_partial:
+            state.paused = True   # desync -- stop trading this coin until reconciled
+    else:
+        state.positions = []
+        state.total_qty_coin = 0.0
+        state.total_cost_usd = 0.0
+        state.avg_entry_price = None
+        state.last_buy_price = None
+        state.cycle_count += 1
+        state.last_action_ts = time.time()
+        state.initial_entry_high = None
+        state.breakeven_exit_armed = False
+        state.trailing_buy = TrailState()
+        state.trailing_sell = TrailState()
+        state.pending_sell_order = None
+
+    qty_field = f"qty={qty:.8f}/{tracked:.8f}" if partial else f"qty={qty:.8f}"
     log.info(
-        f"[{state.mode.upper()}] {tag} "
-        f"price=${fill['price']:.{pp}f} qty={qty:.8f} "
+        f"[{state.mode.upper()}] {tag}{' PARTIAL' if partial else ''} "
+        f"price=${fill['price']:.{pp}f} {qty_field} "
         f"fee=${fill['fee_usd']:.{pp}f} net=${proceeds_net:.{pp}f} "
         f"avg_entry=${avg_entry:.{pp}f} levels={n_levels} "
         f"realized=${realized:.{pp}f} ({pct:+.5f}%) "
         f"cycle={state.cycle_count} ({reason})"
     )
+
+    if partial:
+        if pause_on_partial:
+            log.warning(
+                f"[{state.mode.upper()}] PARTIAL SELL -- only {qty:.8f}/{tracked:.8f} {base} "
+                f"({frac_sold:.1%}) sold; free balance was below the tracked position. "
+                f"Booked PnL on the sold portion only; kept {remaining_qty:.8f} {base} "
+                f"(cost ${state.total_cost_usd:.{pp}f}) on the books and PAUSED the coin. "
+                f"Reconcile tracked qty vs the exchange, then resume or clear-stats "
+                f"(select coin -> menu 4 -> Y)."
+            )
+        else:
+            log.warning(
+                f"[{state.mode.upper()}] PARTIAL SELL -- {qty:.8f}/{tracked:.8f} {base} "
+                f"({frac_sold:.1%}) filled before the order ended; booked PnL on the sold "
+                f"portion and kept {remaining_qty:.8f} {base} "
+                f"(cost ${state.total_cost_usd:.{pp}f}) on the books -- continuing."
+            )
+        mode_tag   = "[PAPER] " if state.mode == "paper" else ""
+        tail       = "coin PAUSED" if pause_on_partial else f"{remaining_qty:.4f} {base} left"
+        await push_notify(
+            f"{mode_tag}{base} PARTIAL sell {qty:.4f}/{tracked:.4f} for {pct:+.5f}% "
+            f"(${realized:.{pp}f}) -- {tail}"
+        )
+        return realized
 
     # One-shot "pause after sell": if armed, pause the coin now that the cycle
     # has closed so it won't open a new buy cycle until manually resumed.
@@ -822,14 +915,29 @@ async def execute_clear_stats(exchange, state: State, cfg: dict,
     )
 
 
+def _sell_fill_from_order(order: dict, pending: PendingSellOrder, filled_qty: float) -> dict:
+    """Build a _finalize_sell `fill` dict from an exchange order's executed portion.
+
+    `cost` is the gross quote received for the filled base amount; net proceeds
+    subtract the fee. Falls back to filled_qty * price when a field is missing.
+    """
+    fill_price   = float(order.get("average") or order.get("price") or pending.limit_price)
+    fee_usd      = float((order.get("fee") or {}).get("cost") or 0.0)
+    proceeds_net = float(order.get("cost") or filled_qty * fill_price) - fee_usd
+    return {"qty": filled_qty, "price": fill_price, "fee_usd": fee_usd,
+            "ts": _now_iso(), "proceeds_net": proceeds_net}
+
+
 async def check_pending_sell(exchange, state: State, wallet: PaperWallet, cfg: dict,
                               ticker: dict, log: logging.LoggerAdapter, push_notify) -> Optional[float]:
     """Poll/simulate fill for an outstanding limit sell. Returns realized PnL on
-    fill, or None if still pending / cancelled / no pending order.
+    fill, or None if still pending / cancelled with nothing filled / no pending order.
 
     Cancel rule: if current price has dropped more than cfg['trail_sell_pct']
     below the resting limit, cancel and clear pending_sell_order so the
-    sell-trail can re-arm on the next rally.
+    sell-trail can re-arm on the next rally. Any portion that executed before the
+    order ended (closed, cancelled, or our own cancel) is always booked -- a
+    dropped partial fill is what desynced SYN in cycle 6.
     """
     pending = state.pending_sell_order
     if pending is None:
@@ -848,27 +956,61 @@ async def check_pending_sell(exchange, state: State, wallet: PaperWallet, cfg: d
             log.warning("LIMIT-SELL %s not found at exchange -- clearing pending", pending.order_id)
             state.pending_sell_order = None
             return None
-        status = (order.get("status") or "").lower()
+        status     = (order.get("status") or "").lower()
+        filled_qty = float(order.get("filled") or 0.0)
+        # A clamped order (placed for materially less than the tracked position)
+        # means free balance was short -> a real desync, pause on partial. A
+        # full-size order that only partly filled leaves the rest in free
+        # balance, so keep trading.
+        desync = pending.qty_coin < state.total_qty_coin * FULL_CLOSE_MIN_FILL_FRAC
+
         if status == "closed":
-            fill_price   = float(order.get("average") or order.get("price") or pending.limit_price)
-            filled_qty   = float(order.get("filled") or pending.qty_coin)
-            fee_usd      = float((order.get("fee") or {}).get("cost") or 0.0)
-            proceeds_net = float(order.get("cost") or filled_qty * fill_price) - fee_usd
-            fill = {"qty": filled_qty, "price": fill_price, "fee_usd": fee_usd,
-                    "ts": _now_iso(), "proceeds_net": proceeds_net}
-            return await _finalize_sell(state, fill, cfg, "limit-sell filled", "LIMIT-SELL FILL", log, push_notify)
-        if status in ("canceled", "cancelled", "rejected", "expired"):
-            log.info("LIMIT-SELL %s ended with status=%s -- clearing pending", pending.order_id, status)
+            if filled_qty <= 0:
+                filled_qty = float(pending.qty_coin)
+            fill = _sell_fill_from_order(order, pending, filled_qty)
+            return await _finalize_sell(state, fill, cfg, "limit-sell filled",
+                                        "LIMIT-SELL FILL", log, push_notify,
+                                        pause_on_partial=desync)
+
+        if status in _TERMINAL_ORDER_STATUSES:   # canceled/expired/rejected (closed handled above)
             state.pending_sell_order = None
+            if filled_qty > 1e-12:
+                log.info("LIMIT-SELL %s ended status=%s with %.8f filled -- booking partial",
+                         pending.order_id, status, filled_qty)
+                fill = _sell_fill_from_order(order, pending, filled_qty)
+                return await _finalize_sell(state, fill, cfg, f"limit-sell {status} (partial fill)",
+                                            "LIMIT-SELL FILL", log, push_notify,
+                                            pause_on_partial=desync)
+            log.info("LIMIT-SELL %s ended with status=%s -- clearing pending", pending.order_id, status)
             return None
+
         # Still open -- check cancel rule
         if price is not None and price < cancel_price:
             log.info(
                 f"[LIVE] LIMIT-SELL cancelling @ ${price:.{pp}f} "
                 f"(limit ${pending.limit_price:.{pp}f}, threshold ${cancel_price:.{pp}f})"
             )
-            await live_cancel_order(exchange, symbol, pending.order_id)
+            try:
+                await live_cancel_order(exchange, symbol, pending.order_id)
+            except Exception as e:
+                log.warning("LIMIT-SELL cancel failed for %s: %s", pending.order_id, e)
             state.pending_sell_order = None
+            # Re-fetch: part of the order may have executed before the cancel
+            # landed. Booking it keeps tracked qty in sync (the SYN cycle-6 bug).
+            try:
+                final = await exchange.fetch_order(pending.order_id, symbol)
+                filled_qty = float(final.get("filled") or 0.0)
+            except Exception as e:
+                log.warning("post-cancel fetch_order failed for %s: %s -- using last-known filled %.8f",
+                            pending.order_id, e, filled_qty)
+                final = order
+            if filled_qty > 1e-12:
+                log.info("LIMIT-SELL %s cancelled with %.8f filled -- booking partial",
+                         pending.order_id, filled_qty)
+                fill = _sell_fill_from_order(final, pending, filled_qty)
+                return await _finalize_sell(state, fill, cfg, "limit-sell cancelled (partial fill)",
+                                            "LIMIT-SELL FILL", log, push_notify,
+                                            pause_on_partial=desync)
         return None
 
     # Paper mode -- check fill on bid crossing
@@ -946,8 +1088,10 @@ def apply_manual(cmd: PendingAction, state: State, cfg: dict, current_price: flo
         if not state.positions:
             log.info("MANUAL: arm-sell-trail ignored -- no open positions")
             return None
-        state.trailing_sell = TrailState(armed=True, extreme=current_price, armed_at_price=current_price)
-        log.info(f"MANUAL: sell-trail ARMED at ${current_price:.{pp}f}")
+        state.trailing_sell = TrailState(armed=True, extreme=current_price, armed_at_price=current_price, manual=True)
+        avg = state.avg_entry_price
+        floor_note = f"won't sell below avg ${avg:.{pp}f}" if avg is not None else "clamped to avg entry"
+        log.info(f"MANUAL: sell-trail ARMED at ${current_price:.{pp}f} (trailing stop -{cfg['trail_sell_pct']:.1%}, {floor_note})")
         return None
 
     if cmd.kind == "arm_breakeven_exit":
